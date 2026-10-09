@@ -1,111 +1,147 @@
 #include "dma_sdram.h"
-#include <stdio.h>
-#include <stdlib.h>
-#include <unistd.h>
+#include <errno.h>
 #include <fcntl.h>
-#include <sys/mman.h>
-#include <stdint.h>
+#include <stdio.h>
 #include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
-#define soc_cv_av
-#include "hwlib.h"
-#include "socal/socal.h"
-#include "socal/hps.h"
-#include "hps_0.h"
+#define HPS_LW_BRIDGE_PHYS 0xFF200000u
+#define HPS_LW_BRIDGE_SPAN 0x00040000u
 
+static volatile uint32_t *dma_ctrl_regs;
+static volatile uint8_t *dma_buffer;
+static void *control_mapping;
+static void *buffer_mapping;
+static int mem_fd = -1;
 
+static uint32_t reg_read(uint32_t byte_offset) {
+    return dma_ctrl_regs[byte_offset / sizeof(uint32_t)];
+}
 
-#define HW_REGS_BASE (ALT_STM_OFST)
-#define HW_REGS_SPAN (0x04000000)
-#define HW_REGS_MASK (HW_REGS_SPAN - 1)
+static void reg_write(uint32_t byte_offset, uint32_t value) {
+    dma_ctrl_regs[byte_offset / sizeof(uint32_t)] = value;
+}
 
-#define REG_SEGMENT_MAX_OFFSET   0
-#define REG_SEGMENT_BASE_ADDRESS 1
-#define REG_SEGMENT_OFFSET       2
-#define REG_SEGMENT_CONTROL      3
+void dma_close(void) {
+    if (buffer_mapping) {
+        munmap(buffer_mapping, DMA_BUFFER_SIZE);
+        buffer_mapping = NULL;
+    }
+    if (control_mapping) {
+        munmap(control_mapping, HPS_LW_BRIDGE_SPAN);
+        control_mapping = NULL;
+    }
+    if (mem_fd >= 0) {
+        close(mem_fd);
+        mem_fd = -1;
+    }
+    dma_ctrl_regs = NULL;
+    dma_buffer = NULL;
+}
 
-#define BUFFER_PHYS 0x10000000  // 物理起始地址
-#define BUFFER_SIZE 0x10000000  // 256 MB
-
-static volatile unsigned long *dma_ctrl_regs = NULL; // DMA 控制寄存器虚拟地址
-static volatile uint8_t *buf = NULL;
-
-// 初始化 DMA 控制器
 int dma_init(void) {
-    int fd;
-    void *periph_virtual_base;
-
-    fd = open("/dev/mem", O_RDWR | O_SYNC);
-    if (fd == -1) {
-        perror("open /dev/mem");
+    dma_close();
+    mem_fd = open("/dev/mem", O_RDWR | O_SYNC);
+    if (mem_fd < 0) {
+        perror("DMA: open /dev/mem");
         return -1;
     }
-
-    periph_virtual_base = mmap(NULL, HW_REGS_SPAN, PROT_READ | PROT_WRITE,
-                               MAP_SHARED, fd, HW_REGS_BASE);
-    if (periph_virtual_base == MAP_FAILED) {
-        perror("mmap");
-        close(fd);
+    control_mapping = mmap(NULL, HPS_LW_BRIDGE_SPAN, PROT_READ | PROT_WRITE,
+                           MAP_SHARED, mem_fd, HPS_LW_BRIDGE_PHYS);
+    if (control_mapping == MAP_FAILED) {
+        control_mapping = NULL;
+        perror("DMA: mmap lightweight bridge");
+        dma_close();
         return -1;
     }
-
-    dma_ctrl_regs = (volatile unsigned long *)(periph_virtual_base +
-                    (ALT_LWFPGASLVS_OFST & HW_REGS_MASK));
-
-    dma_ctrl_regs[REG_SEGMENT_MAX_OFFSET]   = MAX_DMA_SEGMENTS;
-    dma_ctrl_regs[REG_SEGMENT_BASE_ADDRESS] = BUFFER_PHYS;
-
-    fd = open("/dev/mem", O_RDWR | O_SYNC);
-    if (fd < 0) {
-        perror("open /dev/mem for buffer");
+    dma_ctrl_regs = (volatile uint32_t *)((uint8_t *)control_mapping + DMA_CONTROL_LW_OFFSET);
+    buffer_mapping = mmap(NULL, DMA_BUFFER_SIZE, PROT_READ | PROT_WRITE,
+                          MAP_SHARED, mem_fd, DMA_BUFFER_PHYS);
+    if (buffer_mapping == MAP_FAILED) {
+        buffer_mapping = NULL;
+        perror("DMA: mmap SDRAM buffer");
+        dma_close();
         return -1;
     }
-
-    buf = mmap(NULL, BUFFER_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, BUFFER_PHYS);
-    if (buf == MAP_FAILED) {
-        perror("mmap buffer");
-        return -1;
-    }
-
+    dma_buffer = (volatile uint8_t *)buffer_mapping;
+    printf("DMA mapped: control=0x%08X, buffer=0x%08X, frame=%u bytes\n",
+           HPS_LW_BRIDGE_PHYS + DMA_CONTROL_LW_OFFSET,
+           DMA_BUFFER_PHYS, (unsigned)FRAME_SIZE);
+    printf("[DMA] Live frame read: %u aligned 32-bit words (no sequence check)\n",
+           (unsigned)(FRAME_SIZE / sizeof(uint32_t)));
+    /* Do not start recording or overwrite register settings during initialization. */
     return 0;
 }
 
-// 打印 16-bit 补码并映射到 ±5V
-void print_signed16(uint8_t *buf, size_t offset, int count) {
-    int16_t *buf16 = (int16_t *)buf;
-    size_t start_index = offset / 2;
-    int i=0;
+uint32_t dma_get_recorded_count(void) {
+    return dma_ctrl_regs ? reg_read(DMA_REG_RECORDED_COUNT) : 0;
+}
 
-    printf("Print %d x 16-bit signed values from offset %zu:\n", count, offset);
-    for (i = 0; i < count; i++) {
-        int16_t val = buf16[start_index + i];
-        uint16_t raw = (uint16_t)val;
-        double voltage = (double)val * 5.0 / 4096.0;
-        printf("%6d (0x%04X) -> %+6.3f V  ", val, raw, voltage);
-        if ((i + 1) % 4 == 0) printf("\n");
+uint32_t dma_get_frame_seq(void) {
+    return dma_ctrl_regs ? reg_read(DMA_REG_FRAME_SEQ) : 0;
+}
+
+uint32_t dma_get_status(void) {
+    return dma_ctrl_regs ? reg_read(DMA_REG_STATUS) : 0;
+}
+
+int dma_set_record_limit(uint32_t frames) {
+    if (!dma_ctrl_regs || frames == 0 || frames > MAX_DMA_SEGMENTS) {
+        errno = EINVAL;
+        return -1;
     }
-    printf("\n");
+    reg_write(DMA_REG_RECORD_LIMIT, frames);
+    return 0;
 }
 
-// 从 SDRAM 读取数据到传入数组
+int dma_start_recording(void) {
+    if (!dma_ctrl_regs) { errno = ENODEV; return -1; }
+    if ((reg_read(DMA_REG_STATUS) & DMA_STATUS_RECORDING_ACTIVE) != 0) {
+        errno = EBUSY;
+        return -1;
+    }
+    reg_write(DMA_REG_RECORD_CONTROL, 1u);
+    return 0;
+}
+
+int dma_read_live_frame(uint8_t out[FRAME_SIZE]) {
+    const volatile uint32_t *words;
+    uint32_t value;
+    size_t i;
+    if (!out) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (!dma_buffer) {
+        errno = ENODEV;
+        return -1;
+    }
+    words = (const volatile uint32_t *)(const void *)dma_buffer;
+    for (i = 0; i < FRAME_SIZE / sizeof(uint32_t); ++i) {
+        value = words[i];
+        memcpy(out + i * sizeof(value), &value, sizeof(value));
+    }
+    return 0;
+}
+
 void dma_read_values(uint8_t *read_array) {
-    if (!buf || !dma_ctrl_regs || !read_array) return;
-
-    uint32_t offset = dma_ctrl_regs[REG_SEGMENT_OFFSET];
-    //printf("offset!!!!!!! %d", offset);
-    // 计算偏移地址
-    uint8_t *src = (uint8_t *)(buf + offset * FRAME_SIZE); // 每段假设 52 字节
-    memcpy(read_array, src, FRAME_SIZE);
+    if (read_array && dma_read_live_frame(read_array) != 0)
+        memset(read_array, 0, FRAME_SIZE);
 }
 
-// 返回 SDRAM buffer 的虚拟地址
-volatile uint8_t* dma_get_buffer(void) {
-    return buf;
+volatile uint8_t *dma_get_buffer(void) {
+    return dma_buffer;
 }
 
-void trig_buffer_reading_blocked(void) {
-	dma_ctrl_regs[REG_SEGMENT_CONTROL]   = 1;
-	while(dma_ctrl_regs[REG_SEGMENT_CONTROL]==0);
-	return;
+void print_signed16(uint8_t *data, size_t offset, int count) {
+    int i;
+    if (!data || count < 0) return;
+    for (i = 0; i < count; ++i) {
+        int16_t value;
+        memcpy(&value, data + offset + (size_t)i * 2u, sizeof(value));
+        printf("%6d (0x%04X)  ", value, (uint16_t)value);
+        if ((i + 1) % 4 == 0) putchar('\n');
+    }
+    putchar('\n');
 }
-

@@ -1,181 +1,229 @@
+#define _POSIX_C_SOURCE 200809L
+#include "data_writer.h"
+#include "dma_sdram.h"
+#include <errno.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <stdint.h>
-#include <unistd.h>
-#include <sys/types.h>
-#include <sys/wait.h>
-#include <stdbool.h>
-#include <signal.h>
-#include <time.h>
 #include <string.h>
 #include <sys/file.h>
-#include <errno.h>
+#include <sys/time.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
 
-#include "dma_sdram.h"
-
-#define FRAME_WITH_MARKERS (FRAME_SIZE + 4) // "bg" + 52 bytes + "ed"
+#define FRAME_WITH_MARKERS (FRAME_SIZE + 4u)
 #define LOCK_FILE "/tmp/dma_writer.lock"
+#define OUTPUT_DIRECTORY "/mnt/data"
+#define RECORD_POLL_NS 10000000L
+#define RECORD_TIMEOUT_SECONDS 1800u
+#define FILE_BUFFER_SIZE (1024u * 1024u)
 
-// ===== Helper: generate filename by current time =====
-static void get_timestamp_filename(char *buffer, size_t size) {
-    time_t now = time(NULL);
-    struct tm *t = localtime(&now);
-    if (!t) {
-        snprintf(buffer, size, "output_unknown.bin");
-        return;
+static volatile sig_atomic_t writer_pid = 0;
+
+void get_timestamp_filename(char *buffer, size_t size) {
+    time_t now;
+    struct tm result;
+    now = time(NULL);
+    if (localtime_r(&now, &result) == NULL ||
+        strftime(buffer, size, OUTPUT_DIRECTORY "/output_%Y%m%d_%H%M%S.bin", &result) == 0) {
+        if (size > 0) snprintf(buffer, size, OUTPUT_DIRECTORY "/output_unknown.bin");
     }
-    strftime(buffer, size, "/mnt/data/output_%Y%m%d_%H%M%S.bin", t);
 }
 
-// Open file for append binary
-FILE* open_file() {
-    char filename[64];
+FILE *open_file(void) {
+    char filename[128];
+    FILE *fp;
     get_timestamp_filename(filename, sizeof(filename));
-
-    FILE *fp = fopen(filename, "ab");
-    if (!fp) {
-        perror("Failed to open file");
-        exit(EXIT_FAILURE);
-    }
-
-    printf("File created: %s\n", filename);
+    fp = fopen(filename, "wb");
+    if (fp == NULL) perror("DMA writer: fopen");
+    else printf("DMA writer: output=%s\n", filename);
     return fp;
 }
 
-// Write uint8_t array to file
 void write_uint8_array(FILE *fp, const uint8_t *arr, size_t size) {
-    if (!fp || !arr || size == 0) return;
-
-    size_t written = fwrite(arr, sizeof(uint8_t), size, fp);
-    if (written != size) {
-        perror("Failed to write file");
-    }
-
-    fflush(fp);
+    if (fp == NULL || arr == NULL || size == 0) return;
+    if (fwrite(arr, 1, size, fp) != size) perror("DMA writer: fwrite");
 }
 
-// Close file safely
 void close_file(FILE *fp) {
-    if (fp) fclose(fp);
+    if (fp != NULL && fclose(fp) != 0) perror("DMA writer: fclose");
 }
 
-// ===== Writer process management =====
-static pid_t writer_pid = 0;
-
-// SIGCHLD handler: 子进程退出时更新 writer_pid
 static void sigchld_handler(int sig) {
+    int saved_errno;
     int status;
     pid_t pid;
+    (void)sig;
+    saved_errno = errno;
     while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
-        if (pid == writer_pid) {
-            writer_pid = 0;
-            printf("Writer process finished (PID=%d)\n", pid);
+        if (pid == (pid_t)writer_pid) writer_pid = 0;
+    }
+    errno = saved_errno;
+}
+
+static int wait_for_recording(uint32_t expected, uint32_t *recorded) {
+    struct timespec pause_time;
+    struct timeval start_time;
+    struct timeval current_time;
+    uint32_t status;
+    uint32_t count;
+    int observed_new_recording;
+    long elapsed_seconds;
+    long elapsed_microseconds;
+
+    pause_time.tv_sec = 0;
+    pause_time.tv_nsec = RECORD_POLL_NS;
+    observed_new_recording = 0;
+    if (gettimeofday(&start_time, NULL) != 0) return -1;
+    for (;;) {
+        status = dma_get_status();
+        count = dma_get_recorded_count();
+        if ((status & DMA_STATUS_RECORDING_ACTIVE) != 0 ||
+            (status & DMA_STATUS_RECORDING_DONE) == 0)
+            observed_new_recording = 1;
+        if (observed_new_recording && (status & DMA_STATUS_RECORDING_DONE) != 0 &&
+            (status & DMA_STATUS_RECORDING_ACTIVE) == 0) {
+            *recorded = count;
+            if (count != expected) {
+                fprintf(stderr, "DMA writer: expected %u frames, got %u\n",
+                        (unsigned)expected, (unsigned)count);
+                errno = EIO;
+                return -1;
+            }
+            return 0;
         }
+        if (gettimeofday(&current_time, NULL) != 0) return -1;
+        elapsed_seconds = (long)(current_time.tv_sec - start_time.tv_sec);
+        elapsed_microseconds = (long)(current_time.tv_usec - start_time.tv_usec);
+        if (elapsed_microseconds < 0) {
+            --elapsed_seconds;
+            elapsed_microseconds += 1000000L;
+        }
+        if (elapsed_seconds >= (long)RECORD_TIMEOUT_SECONDS) {
+            fprintf(stderr, "DMA writer: recording timed out (count=%u, status=0x%08X)\n",
+                    (unsigned)count, (unsigned)status);
+            errno = ETIMEDOUT;
+            return -1;
+        }
+        while (nanosleep(&pause_time, &pause_time) != 0) {
+            if (errno != EINTR) return -1;
+        }
+        pause_time.tv_sec = 0;
+        pause_time.tv_nsec = RECORD_POLL_NS;
     }
 }
 
-// Start DMA writer process (safe: SIGCHLD + kill check + file lock)
-int start_writer_process() {
-    // ===== 1. 注册 SIGCHLD，只注册一次 =====
-    static bool sigchld_registered = false;
+static int export_history(uint32_t frame_count) {
+    volatile uint8_t *buffer;
+    uint8_t *block;
+    FILE *fp;
+    size_t frames_per_block;
+    size_t block_frames;
+    size_t pos;
+    size_t j;
+    size_t k;
+    uint32_t frame_index;
+    size_t total_bytes;
+    int result;
+
+    buffer = dma_get_buffer();
+    if (buffer == NULL) { errno = ENODEV; return -1; }
+    block = (uint8_t *)malloc(FILE_BUFFER_SIZE);
+    if (block == NULL) return -1;
+    fp = open_file();
+    if (fp == NULL) { free(block); return -1; }
+    frames_per_block = FILE_BUFFER_SIZE / FRAME_WITH_MARKERS;
+    frame_index = 0;
+    result = 0;
+    while (frame_index < frame_count) {
+        block_frames = (size_t)(frame_count - frame_index);
+        if (block_frames > frames_per_block) block_frames = frames_per_block;
+        pos = 0;
+        for (j = 0; j < block_frames; ++j) {
+            size_t source_offset;
+            source_offset = ((size_t)frame_index + j + 1u) * FRAME_SIZE;
+            block[pos++] = 'b';
+            block[pos++] = 'g';
+            for (k = 0; k < FRAME_SIZE; ++k)
+                block[pos++] = buffer[source_offset + k];
+            block[pos++] = 'e';
+            block[pos++] = 'd';
+        }
+        total_bytes = block_frames * FRAME_WITH_MARKERS;
+        if (fwrite(block, 1, total_bytes, fp) != total_bytes) {
+            perror("DMA writer: fwrite");
+            result = -1;
+            break;
+        }
+        frame_index += (uint32_t)block_frames;
+        printf("DMA writer: exported %u / %u frames\n",
+               (unsigned)frame_index, (unsigned)frame_count);
+    }
+    if (fclose(fp) != 0) { perror("DMA writer: fclose"); result = -1; }
+    free(block);
+    return result;
+}
+
+static int writer_child(void) {
+    uint32_t limit;
+    uint32_t recorded;
+    uint32_t status;
+    if (!dma_get_buffer()) { fprintf(stderr, "DMA writer: DMA not initialized\n"); return -1; }
+    status = dma_get_status();
+    if ((status & DMA_STATUS_RECORDING_ACTIVE) != 0) {
+        fprintf(stderr, "DMA writer: recording already active\n");
+        return -1;
+    }
+    limit = MAX_DMA_SEGMENTS;
+    if (dma_set_record_limit(limit) != 0) { perror("DMA writer: set limit"); return -1; }
+    if (dma_start_recording() != 0) { perror("DMA writer: start"); return -1; }
+    printf("DMA writer: recording started, target=%u frames\n", (unsigned)limit);
+    if (wait_for_recording(limit, &recorded) != 0) return -1;
+    printf("DMA writer: recording complete, exporting %u frames\n", (unsigned)recorded);
+    return export_history(recorded);
+}
+
+int start_writer_process(void) {
+    static int sigchld_registered = 0;
+    struct sigaction sa;
+    pid_t pid;
+    int fd;
+    int result;
     if (!sigchld_registered) {
-        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
         sa.sa_handler = sigchld_handler;
         sigemptyset(&sa.sa_mask);
         sa.sa_flags = SA_RESTART | SA_NOCLDSTOP;
-        if (sigaction(SIGCHLD, &sa, NULL) != 0) {
-            perror("Failed to register SIGCHLD handler");
-            return -1;
-        }
-        sigchld_registered = true;
+        if (sigaction(SIGCHLD, &sa, NULL) != 0) { perror("DMA writer: sigaction"); return -1; }
+        sigchld_registered = 1;
     }
-
-    // ===== 2. 检查 writer_pid 是否存在 =====
     if (writer_pid != 0) {
-        if (kill(writer_pid, 0) == 0) {
-            printf("Writer process already running (PID=%d)\n", writer_pid);
-            return -1;
-        } else if (errno == ESRCH) {
-            writer_pid = 0; // PID 不存在
-        } else {
-            perror("kill check failed");
-            return -1;
-        }
-    }
-
-    // ===== 3. 打开文件锁 =====
-    int fd = open(LOCK_FILE, O_CREAT | O_RDWR, 0666);
-    if (fd < 0) {
-        perror("Failed to open lock file");
+        fprintf(stderr, "DMA writer: writer already running (PID=%ld)\n", (long)writer_pid);
         return -1;
     }
-
+    fd = open(LOCK_FILE, O_CREAT | O_RDWR, 0666);
+    if (fd < 0) { perror("DMA writer: lock open"); return -1; }
     if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
-        printf("Writer process already running (lock held)\n");
+        fprintf(stderr, "DMA writer: another writer holds lock\n");
         close(fd);
         return -1;
     }
-
-    // ===== 4. fork 子进程 =====
-    pid_t pid = fork();
+    pid = fork();
     if (pid < 0) {
-        perror("fork failed");
-        flock(fd, LOCK_UN);
+        perror("DMA writer: fork");
         close(fd);
         return -1;
     }
-
     if (pid == 0) {
-    	size_t i = 0;
-        // ===== 子进程逻辑 =====
-        FILE *fp = open_file();
-        printf("Writer process started (PID=%d)\n", getpid());
-
-        // 通知 DMA buffer 完成
-        trig_buffer_reading_blocked();
-        printf("buffer finished!!!!!!!\n");
-
-        volatile uint8_t *buffer = dma_get_buffer();
-        if (!buffer) {
-            fprintf(stderr, "Error: DMA buffer is NULL!\n");
-            close_file(fp);
-            flock(fd, LOCK_UN);
-            close(fd);
-            exit(EXIT_FAILURE);
-        }
-
-        const uint8_t prefix[2] = {'b','g'};
-        const uint8_t suffix[2] = {'e','d'};
-        uint8_t frame_with_markers[FRAME_WITH_MARKERS];
-
-        printf("Start writing DMA data: %d frames, %d bytes per frame...\n",
-               MAX_DMA_SEGMENTS, FRAME_SIZE);
-
-        for (i = 0; i < MAX_DMA_SEGMENTS; i++) {
-            memcpy(frame_with_markers, prefix, 2);
-            memcpy(frame_with_markers + 2, (const void *)(buffer + i*FRAME_SIZE), FRAME_SIZE);
-            memcpy(frame_with_markers + 2 + FRAME_SIZE, suffix, 2);
-            write_uint8_array(fp, frame_with_markers, FRAME_WITH_MARKERS);
-
-            if (i % 100000 == 0) {
-                printf("Written frame %zu / %d\n", i, MAX_DMA_SEGMENTS);
-            }
-        }
-
-        printf("DMA data write complete. Total size: %.2f MB\n",
-               (double)(MAX_DMA_SEGMENTS * FRAME_WITH_MARKERS) / (1024.0 * 1024.0));
-
-        close_file(fp);
-
-        // 释放文件锁
-        flock(fd, LOCK_UN);
+        result = writer_child();
         close(fd);
-
-        exit(0);
-    } else {
-        // ===== 父进程 =====
-        writer_pid = pid;
-        close(fd); // 父进程不保持锁
-        return pid;
+        _exit(result == 0 ? EXIT_SUCCESS : EXIT_FAILURE);
     }
+    writer_pid = (sig_atomic_t)pid;
+    close(fd);
+    return (int)pid;
 }

@@ -1,3 +1,4 @@
+
 #ifndef CONTROL_SOCKET_H
 #define CONTROL_SOCKET_H
 
@@ -7,14 +8,12 @@
 extern "C" {
 #endif
 
-// 回调函数类型：输入命令字节，返回状态字节
 typedef uint8_t (*control_callback_t)(uint8_t cmd);
+typedef uint8_t (*lut_load_callback_t)(const char *filename);
 
-// 启动服务器
 void start_control_server(int port, control_callback_t callback);
-
-// 停止服务器
 void stop_control_server(void);
+void register_lut_load_callback(lut_load_callback_t callback);
 
 #ifdef __cplusplus
 }

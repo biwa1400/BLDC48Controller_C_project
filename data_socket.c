@@ -1,155 +1,186 @@
 #include "data_socket.h"
+#include <arpa/inet.h>
+#include <errno.h>
+#include <pthread.h>
+#include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
-#include <arpa/inet.h>
-#include <pthread.h>
-#include <signal.h>
-#include <errno.h>
+#include <sys/socket.h>
 #include <time.h>
-
+#include <unistd.h>
 #include "dma_sdram.h"
 
-#define SEND_INTERVAL_USEC 1000  // 0.001 秒
+#define SEND_INTERVAL_USEC 200
+#define TCP_FRAME_SIZE (FRAME_SIZE + 4u)
 
-// ================= Global state =================
 static int server_fd = -1;
 static volatile int keep_running = 1;
 
-// ================= Function declarations =================
-static int init_server(int port);
-static void *client_accept_thread(void *arg);
-static void *client_send_thread(void *arg);
-static void prepare_data(uint8_t *buf, size_t buf_size);
-
-// ================= Function definitions =================
-
 static int init_server(int port) {
     int fd;
+    int opt;
     struct sockaddr_in addr;
 
-    if ((fd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
-        perror("socket creation failed");
-        exit(EXIT_FAILURE);
+    fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        perror("Data socket: socket");
+        return -1;
     }
-
-    int opt = 1;
-    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-
+    opt = 1;
+    if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0)
+        perror("Data socket: setsockopt");
+    memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port = htons(port);
-
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port = htons((uint16_t)port);
     if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        perror("bind failed");
+        perror("Data socket: bind");
         close(fd);
-        exit(EXIT_FAILURE);
+        return -1;
     }
-
     if (listen(fd, 5) < 0) {
-        perror("listen failed");
+        perror("Data socket: listen");
         close(fd);
-        exit(EXIT_FAILURE);
+        return -1;
     }
-
-    printf("Server started, listening on port %d\n", port);
+    printf("Data server listening on port %d\n", port);
     return fd;
 }
 
-static void prepare_data(uint8_t *buf, size_t buf_size) {
-    if (buf_size < FRAME_SIZE + 4) return;
+static int prepare_data(uint8_t *buf, size_t buf_size) {
+    if (buf == NULL || buf_size < TCP_FRAME_SIZE) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (dma_read_live_frame(buf + 2) != 0)
+        return -1;
+    buf[0] = 'b';
+    buf[1] = 'g';
+    buf[FRAME_SIZE + 2u] = 'e';
+    buf[FRAME_SIZE + 3u] = 'd';
+    return 0;
+}
 
-    uint8_t data[FRAME_SIZE];
-    dma_read_values(data);  // 从 DMA SDRAM 读取 52 字节数据
-    //print_signed16(data, 0, 28);
+static int send_all(int fd, const uint8_t *data, size_t length) {
+    size_t offset;
+    ssize_t sent;
 
-    memcpy(buf, "bg", 2);
-    memcpy(buf + 2, data, FRAME_SIZE);
-    memcpy(buf + 2 + FRAME_SIZE, "ed", 2);
+    offset = 0;
+    while (offset < length && keep_running) {
+        sent = send(fd, data + offset, length - offset, 0);
+        if (sent > 0) {
+            offset += (size_t)sent;
+            continue;
+        }
+        if (sent < 0 && errno == EINTR)
+            continue;
+        if (sent == 0)
+            errno = EPIPE;
+        return -1;
+    }
+    return offset == length ? 0 : -1;
 }
 
 static void *client_send_thread(void *arg) {
-    int client_fd = *(int *)arg;
+    int client_fd;
+    uint8_t send_buf[TCP_FRAME_SIZE];
+    unsigned int failed_reads;
+
+    client_fd = *(int *)arg;
     free(arg);
-
-    uint8_t send_buf[FRAME_SIZE + 4];
-    printf("[Thread] Client send loop started.\n");
-
+    failed_reads = 0u;
+    printf("[Data] Client send loop started\n");
     while (keep_running) {
-        prepare_data(send_buf, sizeof(send_buf));
-        ssize_t sent = send(client_fd, send_buf, sizeof(send_buf), 0);
-        if (sent <= 0) {
-            perror("[Thread] Send failed or client disconnected");
-            close(client_fd);
-            printf("[Thread] Client connection closed.\n");
-            return NULL;
+        if (prepare_data(send_buf, sizeof(send_buf)) != 0) {
+            ++failed_reads;
+            if (failed_reads == 1u || failed_reads % 1000u == 0u)
+                fprintf(stderr, "[Data] Live frame unavailable (errno=%d, count=%u)\n", errno, failed_reads);
+            usleep(SEND_INTERVAL_USEC);
+            continue;
+        }
+        failed_reads = 0u;
+        if (send_all(client_fd, send_buf, sizeof(send_buf)) != 0) {
+            if (keep_running)
+                perror("[Data] Send failed or client disconnected");
+            break;
         }
         usleep(SEND_INTERVAL_USEC);
     }
-
     close(client_fd);
+    printf("[Data] Client connection closed\n");
     return NULL;
 }
 
 static void *client_accept_thread(void *arg) {
-    int server_fd = *(int *)arg;
+    int listen_fd;
+    int *client_fd_ptr;
     struct sockaddr_in client_addr;
-    socklen_t addr_len = sizeof(client_addr);
+    socklen_t addr_len;
+    pthread_t send_thread;
+    int err;
 
+    listen_fd = *(int *)arg;
     while (keep_running) {
-        int *client_fd_ptr = malloc(sizeof(int));
-        if (!client_fd_ptr) continue;
-
-        *client_fd_ptr = accept(server_fd, (struct sockaddr *)&client_addr, &addr_len);
-        if (*client_fd_ptr < 0) {
-            free(client_fd_ptr);
-            perror("[Accept] Failed");
+        client_fd_ptr = (int *)malloc(sizeof(*client_fd_ptr));
+        if (client_fd_ptr == NULL) {
             usleep(100000);
             continue;
         }
-
-        printf("Client connected: %s\n", inet_ntoa(client_addr.sin_addr));
-
-        pthread_t send_thread;
-        if (pthread_create(&send_thread, NULL, client_send_thread, client_fd_ptr) != 0) {
-            perror("[Accept] Failed to create send thread");
+        addr_len = sizeof(client_addr);
+        *client_fd_ptr = accept(listen_fd, (struct sockaddr *)&client_addr, &addr_len);
+        if (*client_fd_ptr < 0) {
+            err = errno;
+            free(client_fd_ptr);
+            if (!keep_running || err == EBADF || err == EINVAL)
+                break;
+            if (err != EINTR)
+                perror("[Data] accept");
+            usleep(100000);
+            continue;
+        }
+        printf("[Data] Client connected: %s\n", inet_ntoa(client_addr.sin_addr));
+        err = pthread_create(&send_thread, NULL, client_send_thread, client_fd_ptr);
+        if (err != 0) {
+            fprintf(stderr, "[Data] pthread_create failed: %s\n", strerror(err));
             close(*client_fd_ptr);
             free(client_fd_ptr);
         } else {
             pthread_detach(send_thread);
         }
     }
-
     return NULL;
 }
 
-// ================= Public API =================
-
-// Start server (non-blocking, returns immediately)
 void start_data_server(int port) {
-    srand(time(NULL));
-    signal(SIGPIPE, SIG_IGN);
-
-    server_fd = init_server(port);
-
     pthread_t accept_thread;
-    if (pthread_create(&accept_thread, NULL, client_accept_thread, &server_fd) != 0) {
-        perror("Failed to create accept thread");
+    int err;
+
+    if (server_fd >= 0)
+        return;
+    signal(SIGPIPE, SIG_IGN);
+    keep_running = 1;
+    server_fd = init_server(port);
+    if (server_fd < 0)
+        return;
+    err = pthread_create(&accept_thread, NULL, client_accept_thread, &server_fd);
+    if (err != 0) {
+        fprintf(stderr, "[Data] Accept thread creation failed: %s\n", strerror(err));
         close(server_fd);
+        server_fd = -1;
         return;
     }
     pthread_detach(accept_thread);
-
-    printf("Server running (non-blocking), waiting for clients...\n");
+    printf("Data server running (non-blocking)\n");
 }
 
-// Stop server manually
 void stop_data_server(void) {
     keep_running = 0;
-    if (server_fd > 0) {
+    if (server_fd >= 0) {
+        shutdown(server_fd, SHUT_RDWR);
         close(server_fd);
         server_fd = -1;
     }
-    printf("Server stopped.\n");
+    printf("Data server stopped\n");
 }
