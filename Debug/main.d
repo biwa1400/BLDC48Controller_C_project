@@ -1,5 +1,6 @@
 main.o: ../main.c ../dma_sdram.h ../data_writer.h ../data_socket.h \
- ../control_socket.h ../control_motor.h ../sram_worker.h
+ ../control_socket.h ../control_motor.h ../sram_worker.h ../thd_worker.h \
+ ../thd.h ../thd_socket.h
 
 ../dma_sdram.h:
 
@@ -12,3 +13,9 @@ main.o: ../main.c ../dma_sdram.h ../data_writer.h ../data_socket.h \
 ../control_motor.h:
 
 ../sram_worker.h:
+
+../thd_worker.h:
+
+../thd.h:
+
+../thd_socket.h:

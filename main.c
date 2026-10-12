@@ -1,4 +1,3 @@
-
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -10,6 +9,10 @@
 #include "control_socket.h"
 #include "control_motor.h"
 #include "sram_worker.h"
+#include "thd_worker.h"
+#include "thd_socket.h"
+
+#define THD_SAMPLE_RATE_HZ 20000.0f
 
 uint8_t handle_command(uint8_t cmd) {
     int pid;
@@ -65,6 +68,20 @@ int main(int argc, char **argv) {
 
     start_data_server(8888);
     start_control_server(8889, handle_command);
+
+    if (thd_worker_start(THD_SAMPLE_RATE_HZ) != 0) {
+        fprintf(stderr, "Fatal: THD worker initialization failed\n");
+        return EXIT_FAILURE;
+    }
+    printf("[THD] Worker started, sample rate: %.0f Hz\n",
+           THD_SAMPLE_RATE_HZ);
+
+    if (thd_socket_start() != 0) {
+        fprintf(stderr, "Fatal: THD TCP server initialization failed\n");
+        thd_worker_stop();
+        return EXIT_FAILURE;
+    }
+    printf("[THD] TCP server startup requested, port: 10001\n");
 
     for (;;) {
         sleep(10);

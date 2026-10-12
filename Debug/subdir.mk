@@ -10,7 +10,11 @@ C_SRCS += \
 ../data_writer.c \
 ../dma_sdram.c \
 ../main.c \
-../sram_worker.c 
+../sram_worker.c \
+../thd.c \
+../thd_frequency.c \
+../thd_socket.c \
+../thd_worker.c 
 
 OBJS += \
 ./control_motor.o \
@@ -19,7 +23,11 @@ OBJS += \
 ./data_writer.o \
 ./dma_sdram.o \
 ./main.o \
-./sram_worker.o 
+./sram_worker.o \
+./thd.o \
+./thd_frequency.o \
+./thd_socket.o \
+./thd_worker.o 
 
 C_DEPS += \
 ./control_motor.d \
@@ -28,7 +36,11 @@ C_DEPS += \
 ./data_writer.d \
 ./dma_sdram.d \
 ./main.d \
-./sram_worker.d 
+./sram_worker.d \
+./thd.d \
+./thd_frequency.d \
+./thd_socket.d \
+./thd_worker.d 
 
 
 # Each subdirectory must supply rules for building sources it contributes
