@@ -12,7 +12,7 @@
 #include <unistd.h>
 #include "dma_sdram.h"
 
-#define SEND_INTERVAL_USEC 200
+#define SEND_INTERVAL_USEC 100
 #define TCP_FRAME_SIZE (FRAME_SIZE + 4u)
 
 static int server_fd = -1;

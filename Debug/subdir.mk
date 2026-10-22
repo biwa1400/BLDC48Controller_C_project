@@ -10,6 +10,7 @@ C_SRCS += \
 ../data_writer.c \
 ../dma_sdram.c \
 ../main.c \
+../mosfet_override.c \
 ../sram_worker.c \
 ../thd.c \
 ../thd_frequency.c \
@@ -23,6 +24,7 @@ OBJS += \
 ./data_writer.o \
 ./dma_sdram.o \
 ./main.o \
+./mosfet_override.o \
 ./sram_worker.o \
 ./thd.o \
 ./thd_frequency.o \
@@ -36,6 +38,7 @@ C_DEPS += \
 ./data_writer.d \
 ./dma_sdram.d \
 ./main.d \
+./mosfet_override.d \
 ./sram_worker.d \
 ./thd.d \
 ./thd_frequency.d \

@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/file.h>
+#include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -34,9 +35,28 @@ void get_timestamp_filename(char *buffer, size_t size) {
     }
 }
 
+static int ensure_output_directory(void) {
+    struct stat st;
+    if (mkdir(OUTPUT_DIRECTORY, 0755) != 0 && errno != EEXIST) {
+        perror("DMA writer: mkdir " OUTPUT_DIRECTORY);
+        return -1;
+    }
+    if (stat(OUTPUT_DIRECTORY, &st) != 0) {
+        perror("DMA writer: stat " OUTPUT_DIRECTORY);
+        return -1;
+    }
+    if (!S_ISDIR(st.st_mode)) {
+        fprintf(stderr, "DMA writer: %s is not a directory\n", OUTPUT_DIRECTORY);
+        errno = ENOTDIR;
+        return -1;
+    }
+    return 0;
+}
+
 FILE *open_file(void) {
     char filename[128];
     FILE *fp;
+    if (ensure_output_directory() != 0) return NULL;
     get_timestamp_filename(filename, sizeof(filename));
     fp = fopen(filename, "wb");
     if (fp == NULL) perror("DMA writer: fopen");

@@ -39,6 +39,19 @@ static int worker_started;
 static int worker_stopping;
 static int worker_pending;
 
+static int ensure_lut_directory(void) {
+    struct stat st;
+    if (mkdir(LUT_DIR, 0755) != 0 && errno != EEXIST) {
+        fprintf(stderr, "[SRAM] cannot create %s: %s\n", LUT_DIR, strerror(errno));
+        return -1;
+    }
+    if (stat(LUT_DIR, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        fprintf(stderr, "[SRAM] %s is not an accessible directory\n", LUT_DIR);
+        return -1;
+    }
+    return 0;
+}
+
 static int valid_filename(const char *name) {
     size_t n = name ? strnlen(name, FILENAME_MAX_LEN + 1) : 0;
     if (n < 5 || n > FILENAME_MAX_LEN || name[0] == '.' || strcmp(name + n - 4, ".bin")) return 0;
@@ -241,6 +254,7 @@ static void *worker_main(void *unused) {
 }
 
 int sram_worker_init(void) {
+    if (ensure_lut_directory() != 0) return -1;
     pthread_mutex_lock(&worker_mutex);
     if (worker_started) { pthread_mutex_unlock(&worker_mutex); return 0; }
     worker_stopping = 0;

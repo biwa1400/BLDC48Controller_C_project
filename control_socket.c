@@ -1,5 +1,6 @@
 #include "control_socket.h"
 #include "sram_worker.h"
+#include "mosfet_override.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -12,12 +13,16 @@
 #include <sys/socket.h>
 
 #define LUT_LOAD_COMMAND 0x10
+#define MOSFET_MODE_COMMAND 0x20
+#define MOSFET_CHANNEL_COMMAND 0x21
+#define MOSFET_STATE_COMMAND 0x22
 #define LUT_FILENAME_MAX 127
 static int server_fd = -1;
 static volatile int keep_running = 1;
 static control_callback_t command_callback = NULL;
 static lut_load_callback_t lut_callback = NULL;
 static pthread_mutex_t lut_request_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t mosfet_command_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 void register_lut_load_callback(lut_load_callback_t callback) {
     lut_callback = callback;
@@ -30,6 +35,32 @@ static int send_byte(int fd, uint8_t value) {
         if (n < 0 && errno == EINTR) continue;
         return -1;
     }
+}
+
+/* State response: status(1), enabled(1), low(LE32), high(LE32). */
+static int send_mosfet_state(int fd, uint8_t status,
+                             const mosfet_override_state_t *state)
+{
+    uint8_t response[10] = {0};
+    response[0] = status;
+    if (status == 0x00 && state != NULL) {
+        response[1] = state->enabled;
+        uint32_t low = state->outputs_lo;
+        uint32_t high = state->outputs_hi;
+        unsigned i;
+        for (i = 0; i < 4; ++i) {
+            response[2 + i] = (uint8_t)(low >> (8u * i));
+            response[6 + i] = (uint8_t)(high >> (8u * i));
+        }
+    }
+    size_t sent = 0;
+    while (sent < sizeof(response)) {
+        ssize_t n = send(fd, response + sent, sizeof(response) - sent, MSG_NOSIGNAL);
+        if (n > 0) { sent += (size_t)n; continue; }
+        if (n < 0 && errno == EINTR) continue;
+        return -1;
+    }
+    return 0;
 }
 
 static int recv_exact(int fd, void *buffer, size_t size) {
@@ -131,6 +162,31 @@ static void *client_handle_thread(void *arg) {
                 fprintf(stderr, "[Control] Rejected LUT filename.\n");
             }
             printf("[Control] LUT_LOAD final response: 0x%02X\n", status);
+        } else if (cmd == MOSFET_MODE_COMMAND) {
+            uint8_t enable;
+            if (recv_exact(fd, &enable, 1) != 0) break;
+            pthread_mutex_lock(&mosfet_command_mutex);
+            if (enable <= 1 && mosfet_override_set_mode(enable) == 0)
+                status = 0x00;
+            pthread_mutex_unlock(&mosfet_command_mutex);
+            printf("[Control] MOSFET mode request=%u result=0x%02X\n", enable, status);
+        } else if (cmd == MOSFET_CHANNEL_COMMAND) {
+            uint8_t args[2];
+            if (recv_exact(fd, args, sizeof(args)) != 0) break;
+            pthread_mutex_lock(&mosfet_command_mutex);
+            if (mosfet_override_set_channel(args[0], args[1]) == 0)
+                status = 0x00;
+            pthread_mutex_unlock(&mosfet_command_mutex);
+            printf("[Control] MOSFET channel=%u level=%u result=0x%02X\n",
+                   args[0], args[1], status);
+        } else if (cmd == MOSFET_STATE_COMMAND) {
+            mosfet_override_state_t state = {0};
+            pthread_mutex_lock(&mosfet_command_mutex);
+            if (mosfet_override_get_state(&state) == 0)
+                status = 0x00;
+            pthread_mutex_unlock(&mosfet_command_mutex);
+            if (send_mosfet_state(fd, status, &state) != 0) break;
+            continue; /* State command has its own fixed 10-byte response. */
         } else {
             printf("[Control] Received command: 0x%02X\n", cmd);
             if (command_callback) status = command_callback(cmd);

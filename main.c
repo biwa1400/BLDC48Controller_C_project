@@ -1,4 +1,7 @@
 #include <stdint.h>
+#include <errno.h>
+#include <limits.h>
+#include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -8,6 +11,7 @@
 #include "data_socket.h"
 #include "control_socket.h"
 #include "control_motor.h"
+#include "mosfet_override.h"
 #include "sram_worker.h"
 #include "thd_worker.h"
 #include "thd_socket.h"
@@ -63,6 +67,18 @@ int main(int argc, char **argv) {
         dma_close();
         return EXIT_FAILURE;
     }
+
+    /* MOSFET override: fixed Platform Designer lightweight-bridge offset.
+     * Same address convention as DMA_CONTROL_LW_OFFSET.
+     * The driver verifies VERSION (0x4D4F0001) before enabling access.
+     * Initialization does not enable override or change any output.
+     */
+    if (mosfet_override_init(0x00030000u) != 0) {
+        fprintf(stderr, "[MOSFET] FPGA register initialization failed "
+                        "at LW offset 0x30000: %s\n", strerror(errno));
+        return EXIT_FAILURE;
+    }
+    printf("[MOSFET] FPGA override interface ready at LW offset 0x30000\n");
 
     register_lut_load_callback(sram_worker_submit);
 
